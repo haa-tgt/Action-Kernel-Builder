@@ -1,55 +1,144 @@
-#!/bin/sh
+name: Build SailfishOS Miatoll Kernel
 
-set -e -x
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig name (e.g. miatoll_defconfig or vendor/miatoll_defconfig). Leave empty to auto-detect."
+        required: false
+        default: ""
+      kernel_branch:
+        description: "Kernel branch"
+        required: false
+        default: "sailfish"
 
-# Kernel Source
-KERNEL_SOURCE="https://github.com/carlodandan/android_kernel_realme_sm7125"
-KERNEL_BRANCH="A13"
-KERNEL_DEFCONFIG="vendor/atoll-perf_defconfig"
+env:
+  KERNEL_SOURCE: https://github.com/AntonIXO/SailfishOS-Miatoll-Kernel
+  GCC_BRANCH: master-kernel-build-2021
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r416183b.tar.gz
+  GCC_ARM64: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9
+  GCC_ARM32: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9
 
-# Prebuilt Clang Toolchain (AOSP)
-CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r416183b.tar.gz"
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
 
-# Prebuilt GCC Utilities (AOSP)
-GCC_x64="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9"
-GCC_x32="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9"
-GCC_BRANCH="master-kernel-build-2021"
+    steps:
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 git curl make \
+            device-tree-compiler cpio zip xz-utils lz4 ccache
 
-# Setup make Command
-make_fun() {
-	make O=out ARCH=arm64 CC=clang HOSTCC=clang DTC=dtc \
-		CLANG_TRIPLE=aarch64-linux-gnu- \
-		CROSS_COMPILE=aarch64-linux-androidkernel- "$@"
-}
+      - name: Cache toolchains
+        id: cache-tc
+        uses: actions/cache@v4
+        with:
+          path: ~/work/toolchains
+          key: toolchains-clang-r416183b-gcc49-${{ env.GCC_BRANCH }}
 
-# Work Path
-WORK="${HOME}/work"
+      - name: Download toolchains
+        if: steps.cache-tc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/work/toolchains/clang
+          cd ~/work/toolchains
 
-# Kernel Folder Name
-KERNEL="myKernel"
+          # -f makes curl fail on HTTP errors instead of saving an HTML page
+          curl -fL --retry 3 "$CLANG_URL" -o clang.tgz
+          tar -xzf clang.tgz -C clang
+          rm clang.tgz
 
-# Kernel Source Path
-KERNEL_SRC="${WORK}/${KERNEL}"
+          git clone --depth=1 -b "$GCC_BRANCH" "$GCC_ARM64" arm64
+          git clone --depth=1 -b "$GCC_BRANCH" "$GCC_ARM32" arm32
 
-# Prepare Directory
-mkdir -p "${WORK}"
-cd "${WORK}" || exit 1
+      - name: Clone kernel source
+        run: |
+          # fail early with a clear message if the branch doesn't exist
+          git ls-remote --exit-code --heads "$KERNEL_SOURCE" "${{ inputs.kernel_branch }}"
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "$KERNEL_SOURCE" ~/work/kernel
 
-# Cloning all the Necessary files
-if [ ! -d clang ]; then mkdir clang && curl -Lsq "${CLANG_URL}" -o clang.tgz && tar -xzf clang.tgz -C clang; fi
-[ ! -d x64 ] && git clone --depth=1 "${GCC_x64}" -b "${GCC_BRANCH}" ./x64
-[ ! -d x32 ] && git clone --depth=1 "${GCC_x32}" -b "${GCC_BRANCH}" ./x32
-[ ! -d "${KERNEL}" ] && git clone --depth=1 "${KERNEL_SOURCE}" -b "${KERNEL_BRANCH}" "${KERNEL}"
+      - name: Set up toolchain PATH
+        run: |
+          # append to the existing PATH so system tools stay available
+          echo "$HOME/work/toolchains/clang/bin"      >> "$GITHUB_PATH"
+          echo "$HOME/work/toolchains/arm64/bin"      >> "$GITHUB_PATH"
+          echo "$HOME/work/toolchains/arm32/bin"      >> "$GITHUB_PATH"
 
-# Setting Toolchain Path
-PATH="${WORK}/clang/bin:${WORK}/x64/bin:${WORK}/x32/bin:/bin"
+      - name: Verify toolchains
+        run: |
+          clang --version | head -n1
+          aarch64-linux-androidkernel-gcc --version | head -n1 || \
+            aarch64-linux-android-gcc --version | head -n1
+          arm-linux-androideabi-gcc --version | head -n1
 
-# Enter Kernel root directory
-cd "${KERNEL_SRC}" || exit 1
+      - name: Resolve defconfig
+        id: defconfig
+        run: |
+          cd ~/work/kernel
+          DEFCONFIG="${{ inputs.defconfig }}"
 
-# KernelSU - Disable if not building one.
-# curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          if [ -z "$DEFCONFIG" ]; then
+            echo "No defconfig given, searching arch/arm64/configs..."
+            FOUND="$(cd arch/arm64/configs && find . -type f \( -iname '*miatoll*' -o -iname '*sailfish*' \) | sed 's|^\./||' | sort | head -n1)"
+            if [ -z "$FOUND" ]; then
+              echo "::error::Could not auto-detect a defconfig. Available:"
+              (cd arch/arm64/configs && find . -type f -name '*defconfig' | sort)
+              exit 1
+            fi
+            DEFCONFIG="$FOUND"
+          fi
 
-# Start Compiling Kernel
-make_fun "${KERNEL_DEFCONFIG}"
-make_fun -j"$(nproc --all)" 2>&1 | tee build.log 
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            echo "::error::arch/arm64/configs/$DEFCONFIG does not exist"
+            exit 1
+          fi
+
+          echo "Using defconfig: $DEFCONFIG"
+          echo "name=$DEFCONFIG" >> "$GITHUB_OUTPUT"
+
+      - name: Build kernel
+        run: |
+          cd ~/work/kernel
+
+          make_fun() {
+            make O=out ARCH=arm64 \
+              CC=clang HOSTCC=clang \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-androidkernel- \
+              CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+              "$@"
+          }
+
+          make_fun "${{ steps.defconfig.outputs.name }}"
+
+          # bash + pipefail (the Actions default) means a failed make fails the step
+          make_fun -j"$(nproc --all)" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Collect artifacts
+        if: success()
+        run: |
+          cd ~/work/kernel
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp out/.config "$GITHUB_WORKSPACE/artifacts/config"
+          # kernel images, dtbs and dtbo if produced
+          find out/arch/arm64/boot -maxdepth 1 -type f \
+            \( -name 'Image*' -o -name 'dtbo.img' \) -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \;
+          find out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} "$GITHUB_WORKSPACE/artifacts/" \; 2>/dev/null || true
+          ls -lh "$GITHUB_WORKSPACE/artifacts"
+
+      - name: Upload kernel artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: miatoll-sailfish-kernel
+          path: ${{ github.workspace }}/artifacts/*
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ github.workspace }}/build.log
+          if-no-files-found: ignore
