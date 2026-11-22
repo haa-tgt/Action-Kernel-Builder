@@ -6,7 +6,7 @@ name: Build Kinesis v24 BPF Kernel (Miatoll)
 on:
   push:
     paths:
-      - ".github/workflows/build-kinesis-v24.yml"
+      - ".github/workflows/**"
       - "patches/**"
   workflow_dispatch:
     inputs:
@@ -27,6 +27,12 @@ on:
         description: "Force-enable BPF options"
         type: boolean
         default: true
+      little_cpu_mask:
+        description: "LITTLE_CPU_MASK (miatoll: cores 0-5 = 0x3f)"
+        default: "0x3f"
+      big_cpu_mask:
+        description: "BIG_CPU_MASK (miatoll: cores 6-7 = 0xc0)"
+        default: "0xc0"
       changelog:
         description: "Your notes for this build (use \\n for new lines)"
         default: ""
@@ -43,6 +49,8 @@ env:
   # Defaults used when the run is triggered by a push (no inputs available)
   DEFAULT_BRANCH: kinesis-v24-bpf
   DEFAULT_KSU_REF: v0.9.5
+  DEFAULT_LITTLE_MASK: "0x3f"
+  DEFAULT_BIG_MASK: "0xc0"
 
 jobs:
   build:
@@ -61,6 +69,8 @@ jobs:
           IN_KSU: ${{ inputs.enable_kernelsu }}
           IN_KSU_REF: ${{ inputs.kernelsu_ref }}
           IN_BPF: ${{ inputs.enable_bpf }}
+          IN_LITTLE: ${{ inputs.little_cpu_mask }}
+          IN_BIG: ${{ inputs.big_cpu_mask }}
           IN_NOTES: ${{ inputs.changelog }}
         run: |
           {
@@ -69,8 +79,9 @@ jobs:
             echo "ksu=${IN_KSU:-true}"
             echo "ksu_ref=${IN_KSU_REF:-$DEFAULT_KSU_REF}"
             echo "bpf=${IN_BPF:-true}"
+            echo "little=${IN_LITTLE:-$DEFAULT_LITTLE_MASK}"
+            echo "big=${IN_BIG:-$DEFAULT_BIG_MASK}"
           } >> "$GITHUB_OUTPUT"
-          # notes may contain special characters, so use a heredoc delimiter
           {
             echo "notes<<NOTES_EOF"
             echo "${IN_NOTES:-}"
@@ -177,6 +188,14 @@ jobs:
 
           mk "${{ steps.cfg.outputs.name }}"
 
+          # This tree has custom CPU mask options that the defconfig leaves
+          # empty, which made the build stop at an interactive prompt.
+          if grep -q 'LITTLE_CPU_MASK' out/.config; then
+            ./scripts/config --file out/.config \
+              --set-val LITTLE_CPU_MASK "${{ steps.vars.outputs.little }}" \
+              --set-val BIG_CPU_MASK "${{ steps.vars.outputs.big }}"
+          fi
+
           if [ "${{ steps.vars.outputs.ksu }}" = "true" ]; then
             ./scripts/config --file out/.config -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS -e KSU
           fi
@@ -190,7 +209,12 @@ jobs:
 
           mk olddefconfig
 
-          grep -E 'CONFIG_(KSU|KPROBES|BPF_SYSCALL|CGROUP_BPF|NET_CLS_BPF)=' out/.config || true
+          # Answer any remaining new-symbol prompts with their defaults so the
+          # build can never block waiting for input. pipefail is switched off
+          # inside the subshell because "yes" exits with SIGPIPE.
+          ( set +o pipefail; yes "" | mk oldconfig )
+
+          grep -E 'CONFIG_(KSU|KPROBES|BPF_SYSCALL|CGROUP_BPF|NET_CLS_BPF)=|CPU_MASK' out/.config || true
 
           # bash + pipefail (the Actions default): a failed make fails this step
           mk -j"$(nproc --all)" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
