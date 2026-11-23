@@ -119,19 +119,21 @@ jobs:
           echo "$HOME/toolchains/arm64/bin" >> "$GITHUB_PATH"
           echo "$HOME/toolchains/arm32/bin" >> "$GITHUB_PATH"
 
-      # --- FIX 1: Detect the actual GCC prefix instead of hardcoding ---
+      # --- FIX 1: Detect the actual GCC binutils prefix ---
       - name: Detect GCC cross-compiler prefixes
         id: gcc
         run: |
           # The arm64 GCC prebuilt may ship as aarch64-linux-androidkernel-
-          # or as aarch64-linux-android-. Detect whichever is present.
-          if command -v aarch64-linux-androidkernel-gcc &>/dev/null; then
+          # or as aarch64-linux-android-. The master-kernel-build-2021 branch
+          # is binutils-only (no standalone gcc binary), so detect via 'ld'.
+          if command -v aarch64-linux-androidkernel-ld &>/dev/null; then
             echo "cross=aarch64-linux-androidkernel-" >> "$GITHUB_OUTPUT"
-          elif command -v aarch64-linux-android-gcc &>/dev/null; then
+          elif command -v aarch64-linux-android-ld &>/dev/null; then
             echo "cross=aarch64-linux-android-" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::No aarch64 GCC cross-compiler found in PATH"
-            ls -1 "$HOME/toolchains/arm64/bin/" | head -20
+            echo "::error::No aarch64 GCC binutils found in PATH"
+            echo "Contents of arm64/bin:"
+            ls -1 "$HOME/toolchains/arm64/bin/" | head -30
             exit 1
           fi
 
@@ -139,10 +141,10 @@ jobs:
         run: |
           echo "Clang:"
           clang --version | head -n1
-          echo "GCC arm64 (prefix: ${{ steps.gcc.outputs.cross }}):"
-          ${{ steps.gcc.outputs.cross }}gcc --version | head -n1
-          echo "GCC arm32:"
-          arm-linux-androideabi-gcc --version | head -n1
+          echo "GCC arm64 binutils (prefix: ${{ steps.gcc.outputs.cross }}):"
+          ${{ steps.gcc.outputs.cross }}ld --version | head -n1
+          echo "GCC arm32 binutils:"
+          arm-linux-androideabi-ld --version | head -n1
 
       - name: Clone kernel
         run: |
