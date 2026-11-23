@@ -117,10 +117,7 @@ jobs:
         run: |
           clang --version | head -n1
           command -v aarch64-linux-gnu-ld aarch64-linux-gnu-ld.gold arm-linux-gnueabi-ld
-          # the kernel Makefile passes -polly-* options, so confirm clang accepts them
-          echo 'int main(void){return 0;}' > /tmp/t.c
-          clang -O3 -mllvm -polly -mllvm -polly-reschedule=1 -c /tmp/t.c -o /tmp/t.o \
-            && echo "polly options accepted"
+          ld.lld --version | head -n1 || true
 
       - name: Clone kernel
         run: |
@@ -179,6 +176,30 @@ jobs:
             echo "Applying $p"
             git apply --index "$p" || patch -p1 < "$p"
           done
+
+      - name: Strip Polly options this clang does not support
+        run: |
+          cd ~/kernel
+          FILES="$(grep -rlE -- '-polly' Makefile arch/arm64/Makefile scripts 2>/dev/null || true)"
+          REMOVED=""
+          if [ -n "$FILES" ]; then
+            for opt in $(grep -rhoE -- '-polly[A-Za-z0-9_=.-]*' $FILES | sort -u); do
+              [ "$opt" = "-polly" ] && continue
+              if ! clang -x c /dev/null -c -o /tmp/polly_test.o -mllvm "$opt" >/dev/null 2>&1; then
+                echo "clang rejects $opt -> removing it from the Makefiles"
+                REMOVED="$REMOVED $opt"
+                for f in $FILES; do
+                  sed -i -E "s/(-mllvm[[:space:]]+)?${opt}([[:space:]]|\\\\|$)/\2/g" "$f"
+                done
+              fi
+            done
+          fi
+          {
+            echo "### Polly options removed (not supported by this clang)"
+            echo '```'
+            echo "${REMOVED:-none}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Add KernelSU (if wanted and not already in the tree)
         id: ksu
@@ -304,6 +325,7 @@ jobs:
       - name: Diagnose undefined scheduler symbols (summary only)
         if: failure()
         run: |
+          [ -d ~/kernel/out ] || { echo "kernel not configured yet, nothing to diagnose"; exit 0; }
           cd ~/kernel
           {
             echo "### Diagnosis"
