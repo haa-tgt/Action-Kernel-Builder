@@ -90,8 +90,8 @@ jobs:
 
       - name: Install host dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
             bc bison flex libssl-dev libelf-dev python3 git curl make \
             device-tree-compiler cpio zip xz-utils lz4 ccache
 
@@ -110,8 +110,8 @@ jobs:
           curl -fL --retry 3 "$CLANG_URL" -o clang.tgz
           tar -xzf clang.tgz -C clang
           rm clang.tgz
-          git clone --depth=1 -b "$GCC_BRANCH" "$GCC_ARM64" arm64
-          git clone --depth=1 -b "$GCC_BRANCH" "$GCC_ARM32" arm32
+          git clone -q --depth=1 -b "$GCC_BRANCH" "$GCC_ARM64" arm64
+          git clone -q --depth=1 -b "$GCC_BRANCH" "$GCC_ARM32" arm32
 
       - name: Set toolchain PATH
         run: |
@@ -128,7 +128,7 @@ jobs:
       - name: Clone kernel
         run: |
           git ls-remote --exit-code --heads "$KERNEL_SOURCE" "${{ steps.vars.outputs.branch }}"
-          git clone --depth=30 -b "${{ steps.vars.outputs.branch }}" "$KERNEL_SOURCE" ~/kernel
+          git clone -q --depth=30 -b "${{ steps.vars.outputs.branch }}" "$KERNEL_SOURCE" ~/kernel
 
       - name: Resolve defconfig and list overclock candidates
         id: cfg
@@ -176,11 +176,11 @@ jobs:
             echo "added=yes (${{ steps.vars.outputs.ksu_ref }})" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build kernel
+      - name: Configure kernel
         run: |
           cd ~/kernel
           mk() {
-            make O=out ARCH=arm64 CC=clang HOSTCC=clang \
+            make -s O=out ARCH=arm64 CC=clang HOSTCC=clang \
               CLANG_TRIPLE=aarch64-linux-gnu- \
               CROSS_COMPILE=aarch64-linux-androidkernel- \
               CROSS_COMPILE_ARM32=arm-linux-androideabi- "$@"
@@ -188,13 +188,44 @@ jobs:
 
           mk "${{ steps.cfg.outputs.name }}"
 
-          # This tree has custom CPU mask options that the defconfig leaves
-          # empty, which made the build stop at an interactive prompt.
-          if grep -q 'LITTLE_CPU_MASK' out/.config; then
-            ./scripts/config --file out/.config \
-              --set-val LITTLE_CPU_MASK "${{ steps.vars.outputs.little }}" \
-              --set-val BIG_CPU_MASK "${{ steps.vars.outputs.big }}"
+          # ---- CPU mask fix -------------------------------------------------
+          # This tree has custom LITTLE_CPU_MASK / BIG_CPU_MASK options that the
+          # defconfig leaves empty, so the build stops at an interactive prompt.
+          # Find the option's TYPE in Kconfig and write a value of that type.
+          KFILE="$(grep -rl --include='Kconfig*' '^config LITTLE_CPU_MASK' . 2>/dev/null | head -n1 || true)"
+          TYPE=""
+          if [ -n "$KFILE" ]; then
+            TYPE="$(awk '/^config LITTLE_CPU_MASK/{f=1;next} f&&/^config /{exit} f&&$1~/^(hex|string|int)$/{print $1;exit}' "$KFILE")"
           fi
+          LITTLE="${{ steps.vars.outputs.little }}"
+          BIG="${{ steps.vars.outputs.big }}"
+
+          {
+            echo "### CPU mask option"
+            echo "- Kconfig file: ${KFILE:-not found}"
+            echo "- Type: ${TYPE:-unknown}"
+            if [ -n "$KFILE" ]; then
+              echo '```'
+              grep -n -A8 '^config LITTLE_CPU_MASK' "$KFILE" | head -n 14
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$KFILE" ]; then
+            sed -i '/CONFIG_LITTLE_CPU_MASK/d;/CONFIG_BIG_CPU_MASK/d' out/.config
+            case "$TYPE" in
+              string)
+                echo "CONFIG_LITTLE_CPU_MASK=\"$LITTLE\"" >> out/.config
+                echo "CONFIG_BIG_CPU_MASK=\"$BIG\""       >> out/.config ;;
+              int)
+                echo "CONFIG_LITTLE_CPU_MASK=$((LITTLE))" >> out/.config
+                echo "CONFIG_BIG_CPU_MASK=$((BIG))"       >> out/.config ;;
+              *)  # hex (or unknown): needs the 0x prefix, unquoted
+                echo "CONFIG_LITTLE_CPU_MASK=$LITTLE" >> out/.config
+                echo "CONFIG_BIG_CPU_MASK=$BIG"       >> out/.config ;;
+            esac
+          fi
+          # -------------------------------------------------------------------
 
           if [ "${{ steps.vars.outputs.ksu }}" = "true" ]; then
             ./scripts/config --file out/.config -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS -e KSU
@@ -212,12 +243,41 @@ jobs:
           # Answer any remaining new-symbol prompts with their defaults so the
           # build can never block waiting for input. pipefail is switched off
           # inside the subshell because "yes" exits with SIGPIPE.
-          ( set +o pipefail; yes "" | mk oldconfig )
+          ( set +o pipefail; yes "" | mk oldconfig > /dev/null 2>&1 ) || true
 
-          grep -E 'CONFIG_(KSU|KPROBES|BPF_SYSCALL|CGROUP_BPF|NET_CLS_BPF)=|CPU_MASK' out/.config || true
+          {
+            echo "### Resulting config values"
+            echo '```'
+            grep -E 'CONFIG_(KSU|KPROBES|BPF_SYSCALL|CGROUP_BPF|NET_CLS_BPF)=|CPU_MASK' out/.config || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          # bash + pipefail (the Actions default): a failed make fails this step
-          mk -j"$(nproc --all)" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+      - name: Build kernel
+        run: |
+          cd ~/kernel
+          # make -s keeps the log small; errors are still printed.
+          # bash + pipefail (the Actions default): a failed make fails this step.
+          make -s -j"$(nproc --all)" O=out ARCH=arm64 CC=clang HOSTCC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-androidkernel- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Show the first errors in the run summary (no need to open the log)
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            {
+              echo "### First errors from build.log"
+              echo '```'
+              grep -nE "error:|\*\*\*|Error [0-9]|NEW\)|aborted" build.log | head -n 30 || true
+              echo '```'
+              echo "### Last 40 lines"
+              echo '```'
+              tail -n 40 build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Generate changelog
         env:
