@@ -1,0 +1,398 @@
+name: Build Kinesis v24 BPF Kernel (Miatoll)
+
+# Runs automatically when you push this file or anything in patches/,
+# or manually from the Actions tab. Every option has a default, so you
+# never have to fill anything in.
+on:
+  push:
+    paths:
+      - ".github/workflows/**"
+      - "patches/**"
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: "Kernel branch"
+        default: "kinesis-v24-bpf"
+      defconfig:
+        description: "Defconfig. Empty = auto-detect"
+        default: ""
+      enable_kernelsu:
+        description: "Add KernelSU (skipped automatically if the tree already has it)"
+        type: boolean
+        default: true
+      kernelsu_ref:
+        description: "KernelSU tag/branch for setup.sh"
+        default: "v0.9.5"
+      enable_bpf:
+        description: "Force-enable BPF options"
+        type: boolean
+        default: true
+      little_cpu_mask:
+        description: "LITTLE_CPU_MASK (miatoll: cores 0-5 = 0x3f)"
+        default: "0x3f"
+      big_cpu_mask:
+        description: "BIG_CPU_MASK (miatoll: cores 6-7 = 0xc0)"
+        default: "0xc0"
+      changelog:
+        description: "Your notes for this build (use \\n for new lines)"
+        default: ""
+
+permissions:
+  contents: write   # needed to publish the release
+
+env:
+  KERNEL_SOURCE: https://github.com/clarencelol/kernel_xiaomi_sm6250
+  GCC_BRANCH: master-kernel-build-2021
+  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r416183b.tar.gz
+  GCC_ARM64: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9
+  GCC_ARM32: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9
+  # Defaults used when the run is triggered by a push (no inputs available)
+  DEFAULT_BRANCH: kinesis-v24-bpf
+  DEFAULT_KSU_REF: v0.9.5
+  DEFAULT_LITTLE_MASK: "0x3f"
+  DEFAULT_BIG_MASK: "0xc0"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout this repo (for optional patches/ folder)
+        uses: actions/checkout@v4
+
+      - name: Resolve settings (inputs or defaults)
+        id: vars
+        env:
+          IN_BRANCH: ${{ inputs.kernel_branch }}
+          IN_DEFCONFIG: ${{ inputs.defconfig }}
+          IN_KSU: ${{ inputs.enable_kernelsu }}
+          IN_KSU_REF: ${{ inputs.kernelsu_ref }}
+          IN_BPF: ${{ inputs.enable_bpf }}
+          IN_LITTLE: ${{ inputs.little_cpu_mask }}
+          IN_BIG: ${{ inputs.big_cpu_mask }}
+          IN_NOTES: ${{ inputs.changelog }}
+        run: |
+          {
+            echo "branch=${IN_BRANCH:-$DEFAULT_BRANCH}"
+            echo "defconfig=${IN_DEFCONFIG:-}"
+            echo "ksu=${IN_KSU:-true}"
+            echo "ksu_ref=${IN_KSU_REF:-$DEFAULT_KSU_REF}"
+            echo "bpf=${IN_BPF:-true}"
+            echo "little=${IN_LITTLE:-$DEFAULT_LITTLE_MASK}"
+            echo "big=${IN_BIG:-$DEFAULT_BIG_MASK}"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "notes<<NOTES_EOF"
+            echo "${IN_NOTES:-}"
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev python3 git curl make \
+            device-tree-compiler cpio zip xz-utils lz4 ccache
+
+      - name: Cache toolchains
+        id: cache-tc
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains
+          key: tc-clang-r416183b-gcc49-${{ env.GCC_BRANCH }}
+
+      - name: Download toolchains
+        if: steps.cache-tc.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/toolchains/clang
+          cd ~/toolchains
+          curl -fL --retry 3 "$CLANG_URL" -o clang.tgz
+          tar -xzf clang.tgz -C clang
+          rm clang.tgz
+          git clone -q --depth=1 -b "$GCC_BRANCH" "$GCC_ARM64" arm64
+          git clone -q --depth=1 -b "$GCC_BRANCH" "$GCC_ARM32" arm32
+
+      - name: Set toolchain PATH
+        run: |
+          echo "$HOME/toolchains/clang/bin" >> "$GITHUB_PATH"
+          echo "$HOME/toolchains/arm64/bin" >> "$GITHUB_PATH"
+          echo "$HOME/toolchains/arm32/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchains
+        run: |
+          clang --version | head -n1
+          (aarch64-linux-androidkernel-gcc --version || aarch64-linux-android-gcc --version) | head -n1
+          arm-linux-androideabi-gcc --version | head -n1
+
+      - name: Clone kernel
+        run: |
+          git ls-remote --exit-code --heads "$KERNEL_SOURCE" "${{ steps.vars.outputs.branch }}"
+          git clone -q --depth=30 -b "${{ steps.vars.outputs.branch }}" "$KERNEL_SOURCE" ~/kernel
+
+      - name: Resolve defconfig and list overclock candidates
+        id: cfg
+        run: |
+          cd ~/kernel
+          DEF="${{ steps.vars.outputs.defconfig }}"
+          if [ -z "$DEF" ]; then
+            DEF="$(cd arch/arm64/configs && find . -type f \( -iname '*miatoll*' -o -iname '*curtana*' -o -iname '*atoll*' -o -iname '*sm6250*' \) | sed 's|^\./||' | sort | head -n1)"
+          fi
+          if [ -z "$DEF" ] || [ ! -f "arch/arm64/configs/$DEF" ]; then
+            echo "::error::Defconfig not found. Available:"
+            (cd arch/arm64/configs && find . -type f -name '*defconfig' | sed 's|^\./||' | sort)
+            exit 1
+          fi
+          echo "name=$DEF" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Defconfig: $DEF"
+            echo "### Frequency table candidates (for an overclock patch)"
+            echo '```'
+            grep -rnE "qcom,gpu-freq|opp-hz|qcom,cpu-lut|qcom,cpufreq-hw" \
+              arch/arm64/boot/dts/ 2>/dev/null | grep -Ei "atoll|sm6250|miatoll|curtana" | head -60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply patches (patches/*.patch, e.g. overclock)
+        run: |
+          cd ~/kernel
+          for p in "$GITHUB_WORKSPACE"/patches/*.patch; do
+            [ -e "$p" ] || continue
+            echo "Applying $p"
+            git apply --index "$p" || patch -p1 < "$p"
+          done
+
+      - name: Add KernelSU (if wanted and not already in the tree)
+        id: ksu
+        run: |
+          cd ~/kernel
+          if [ "${{ steps.vars.outputs.ksu }}" != "true" ]; then
+            echo "added=no (disabled)" >> "$GITHUB_OUTPUT"
+          elif [ -d drivers/kernelsu ] || grep -rqs "config KSU" drivers/Kconfig drivers/kernelsu 2>/dev/null; then
+            echo "KernelSU already present in the tree, skipping setup"
+            echo "added=already in source" >> "$GITHUB_OUTPUT"
+          else
+            curl -fLSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "${{ steps.vars.outputs.ksu_ref }}"
+            echo "added=yes (${{ steps.vars.outputs.ksu_ref }})" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure kernel
+        run: |
+          cd ~/kernel
+          mk() {
+            make -s O=out ARCH=arm64 CC=clang HOSTCC=clang \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-androidkernel- \
+              CROSS_COMPILE_ARM32=arm-linux-androideabi- "$@"
+          }
+
+          mk "${{ steps.cfg.outputs.name }}"
+
+          # ---- CPU mask fix -------------------------------------------------
+          # This tree has custom LITTLE_CPU_MASK / BIG_CPU_MASK options that the
+          # defconfig leaves empty, so the build stops at an interactive prompt.
+          # Find the option's TYPE in Kconfig and write a value of that type.
+          KFILE="$(grep -rl --include='Kconfig*' '^config LITTLE_CPU_MASK' . 2>/dev/null | head -n1 || true)"
+          TYPE=""
+          if [ -n "$KFILE" ]; then
+            TYPE="$(awk '/^config LITTLE_CPU_MASK/{f=1;next} f&&/^config /{exit} f&&$1~/^(hex|string|int)$/{print $1;exit}' "$KFILE")"
+          fi
+          LITTLE="${{ steps.vars.outputs.little }}"
+          BIG="${{ steps.vars.outputs.big }}"
+
+          {
+            echo "### CPU mask option"
+            echo "- Kconfig file: ${KFILE:-not found}"
+            echo "- Type: ${TYPE:-unknown}"
+            if [ -n "$KFILE" ]; then
+              echo '```'
+              grep -n -A8 '^config LITTLE_CPU_MASK' "$KFILE" | head -n 14
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -n "$KFILE" ]; then
+            sed -i '/CONFIG_LITTLE_CPU_MASK/d;/CONFIG_BIG_CPU_MASK/d' out/.config
+            case "$TYPE" in
+              string)
+                echo "CONFIG_LITTLE_CPU_MASK=\"$LITTLE\"" >> out/.config
+                echo "CONFIG_BIG_CPU_MASK=\"$BIG\""       >> out/.config ;;
+              int)
+                echo "CONFIG_LITTLE_CPU_MASK=$((LITTLE))" >> out/.config
+                echo "CONFIG_BIG_CPU_MASK=$((BIG))"       >> out/.config ;;
+              *)  # hex (or unknown): needs the 0x prefix, unquoted
+                echo "CONFIG_LITTLE_CPU_MASK=$LITTLE" >> out/.config
+                echo "CONFIG_BIG_CPU_MASK=$BIG"       >> out/.config ;;
+            esac
+          fi
+          # -------------------------------------------------------------------
+
+          if [ "${{ steps.vars.outputs.ksu }}" = "true" ]; then
+            ./scripts/config --file out/.config -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS -e KSU
+          fi
+
+          if [ "${{ steps.vars.outputs.bpf }}" = "true" ]; then
+            ./scripts/config --file out/.config \
+              -e BPF -e BPF_SYSCALL -e BPF_JIT -e BPF_JIT_ALWAYS_ON -e CGROUP_BPF \
+              -e BPF_STREAM_PARSER -e BPF_EVENTS -e NET_CLS_BPF -e NET_ACT_BPF \
+              -e NET_SCH_INGRESS -e NETFILTER_XT_MATCH_BPF
+          fi
+
+          mk olddefconfig
+
+          # Answer any remaining new-symbol prompts with their defaults so the
+          # build can never block waiting for input. pipefail is switched off
+          # inside the subshell because "yes" exits with SIGPIPE.
+          ( set +o pipefail; yes "" | mk oldconfig > /dev/null 2>&1 ) || true
+
+          {
+            echo "### Resulting config values"
+            echo '```'
+            grep -E 'CONFIG_(KSU|KPROBES|BPF_SYSCALL|CGROUP_BPF|NET_CLS_BPF)=|CPU_MASK' out/.config || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build kernel
+        run: |
+          cd ~/kernel
+          # make -s keeps the log small; errors are still printed.
+          # bash + pipefail (the Actions default): a failed make fails this step.
+          make -s -j"$(nproc --all)" O=out ARCH=arm64 CC=clang HOSTCC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-androidkernel- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Show the first errors in the run summary (no need to open the log)
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            {
+              echo "### First errors from build.log"
+              echo '```'
+              grep -nE "error:|\*\*\*|Error [0-9]|NEW\)|aborted" build.log | head -n 30 || true
+              echo '```'
+              echo "### Last 40 lines"
+              echo '```'
+              tail -n 40 build.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Generate changelog
+        env:
+          NOTES: ${{ steps.vars.outputs.notes }}
+          BRANCH: ${{ steps.vars.outputs.branch }}
+          KSU: ${{ steps.ksu.outputs.added }}
+          BPF: ${{ steps.vars.outputs.bpf }}
+          DEFCONFIG: ${{ steps.cfg.outputs.name }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out_files"
+          cd ~/kernel
+          {
+            echo "# Build changelog"
+            echo
+            echo "- Kernel version: $(make -s kernelversion 2>/dev/null || echo unknown)"
+            echo "- Source: $KERNEL_SOURCE ($BRANCH @ $(git rev-parse --short HEAD))"
+            echo "- Defconfig: $DEFCONFIG"
+            echo "- KernelSU: $KSU"
+            echo "- BPF options forced on: $BPF"
+            echo "- Built: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            if [ -n "$NOTES" ]; then
+              echo
+              echo "## Notes"
+              printf '%b\n' "$NOTES"
+            fi
+            echo
+            echo "## Recent upstream commits"
+            git log -n 20 --pretty='- %s (%h)'
+          } > "$GITHUB_WORKSPACE/out_files/CHANGELOG.md"
+          cat "$GITHUB_WORKSPACE/out_files/CHANGELOG.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package flashable zip (AnyKernel3)
+        run: |
+          BOOT="$HOME/kernel/out/arch/arm64/boot"
+          mkdir -p "$GITHUB_WORKSPACE/out_files"
+          cd ~
+          git clone -q --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git .github README.md
+
+          cat > anykernel.sh <<'EOF'
+          # AnyKernel3 script for Miatoll (SM6250)
+          properties() { '
+          kernel.string=Kinesis v24 BPF build
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=miatoll
+          device.name2=curtana
+          device.name3=excalibur
+          device.name4=gram
+          device.name5=joyeuse
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          # boot image location (Miatoll is A-only)
+          BLOCK=boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+
+          # Use whichever kernel image the build produced
+          if   [ -f "$BOOT/Image.gz-dtb" ]; then cp "$BOOT/Image.gz-dtb" .
+          elif [ -f "$BOOT/Image.gz" ];     then cp "$BOOT/Image.gz" .
+          elif [ -f "$BOOT/Image" ];        then cp "$BOOT/Image" .
+          else echo "::error::No kernel image found in $BOOT"; exit 1; fi
+
+          # Separate dtbs (only needed when the dtb isn't appended to the image)
+          if [ ! -f Image.gz-dtb ]; then
+            find "$HOME/kernel/out/arch/arm64/boot/dts" -name '*.dtb' | sort | xargs -r cat > dtb || true
+            [ -s dtb ] || rm -f dtb
+          fi
+
+          ZIP="Kinesis-v24-miatoll-${{ github.run_number }}.zip"
+          zip -r9 "$GITHUB_WORKSPACE/out_files/$ZIP" . -x '*.git*'
+          ls -lh "$GITHUB_WORKSPACE/out_files/$ZIP"
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out_files"
+          cd ~/kernel
+          cp out/.config "$GITHUB_WORKSPACE/out_files/config"
+          find out/arch/arm64/boot -maxdepth 1 -type f \( -name 'Image*' -o -name 'dtbo.img' \) \
+            -exec cp {} "$GITHUB_WORKSPACE/out_files/" \;
+          find out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} "$GITHUB_WORKSPACE/out_files/" \; || true
+          ls -lh "$GITHUB_WORKSPACE/out_files"
+
+      - name: Upload kernel files
+        uses: actions/upload-artifact@v4
+        with:
+          name: miatoll-kinesis-v24
+          path: out_files/*
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out_files/* \
+            --title "Kinesis v24 build #${{ github.run_number }}" \
+            --notes-file out_files/CHANGELOG.md
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
