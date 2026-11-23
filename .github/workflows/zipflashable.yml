@@ -42,10 +42,9 @@ permissions:
 
 env:
   KERNEL_SOURCE: https://github.com/clarencelol/kernel_xiaomi_sm6250
-  GCC_BRANCH: master-kernel-build-2021
-  CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master-kernel-build-2021/clang-r416183b.tar.gz
-  GCC_ARM64: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9
-  GCC_ARM32: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9
+  # Proton clang: newer than AOSP clang r416183b and includes Polly, which this
+  # kernel's Makefile needs (-polly-* options). It also ships aarch64/arm binutils.
+  TOOLCHAIN_REPO: https://github.com/kdrag0n/proton-clang
   # Defaults used when the run is triggered by a push (no inputs available)
   DEFAULT_BRANCH: kinesis-v24-bpf
   DEFAULT_KSU_REF: v0.9.5
@@ -93,66 +92,35 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
             bc bison flex libssl-dev libelf-dev python3 git curl make \
-            device-tree-compiler cpio zip xz-utils lz4 ccache
+            device-tree-compiler cpio zip xz-utils lz4 ccache \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
       - name: Cache toolchains
         id: cache-tc
         uses: actions/cache@v4
         with:
           path: ~/toolchains
-          key: tc-clang-r416183b-gcc49-${{ env.GCC_BRANCH }}
+          key: tc-proton-clang-v1
 
       - name: Download toolchains
         if: steps.cache-tc.outputs.cache-hit != 'true'
         run: |
-          mkdir -p ~/toolchains/clang
-          cd ~/toolchains
-          curl -fL --retry 3 "$CLANG_URL" -o clang.tgz
-          tar -xzf clang.tgz -C clang
-          rm clang.tgz
-          git clone -q --depth=1 -b "$GCC_BRANCH" "$GCC_ARM64" arm64
-          git clone -q --depth=1 -b "$GCC_BRANCH" "$GCC_ARM32" arm32
+          mkdir -p ~/toolchains
+          git clone -q --depth=1 "$TOOLCHAIN_REPO" ~/toolchains/proton
+          rm -rf ~/toolchains/proton/.git
 
       - name: Set toolchain PATH
         run: |
-          echo "$HOME/toolchains/clang/bin" >> "$GITHUB_PATH"
-          echo "$HOME/toolchains/arm64/bin" >> "$GITHUB_PATH"
-          echo "$HOME/toolchains/arm32/bin" >> "$GITHUB_PATH"
-
-      - name: Fill in missing binutils tools (ld.gold etc.)
-        run: |
-          # Some kernels link with ld.gold. The AOSP GCC prebuilts under the
-          # "androidkernel" prefix don't ship it, so borrow the matching tool
-          # from Ubuntu's cross binutils and expose it under the expected name.
-          sudo apt-get install -y -qq --no-install-recommends \
-            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
-          SHIM="$HOME/shims"
-          mkdir -p "$SHIM"
-          shim() {
-            want="$1"; shift
-            if command -v "$want" >/dev/null 2>&1; then return 0; fi
-            for alt in "$@"; do
-              if p="$(command -v "$alt" 2>/dev/null)"; then
-                ln -sf "$p" "$SHIM/$want"
-                echo "shim: $want -> $p"
-                return 0
-              fi
-            done
-            echo "::warning::no replacement found for $want"
-          }
-          for t in ld ld.bfd ld.gold; do
-            shim "aarch64-linux-androidkernel-$t" "aarch64-linux-android-$t" "aarch64-linux-gnu-$t"
-            shim "aarch64-linux-android-$t"       "aarch64-linux-androidkernel-$t" "aarch64-linux-gnu-$t"
-            shim "arm-linux-androideabi-$t"       "arm-linux-gnueabi-$t" "arm-linux-gnueabihf-$t"
-          done
-          echo "$SHIM" >> "$GITHUB_PATH"
-          ls -l "$SHIM" || true
+          echo "$HOME/toolchains/proton/bin" >> "$GITHUB_PATH"
 
       - name: Verify toolchains
         run: |
           clang --version | head -n1
-          (aarch64-linux-androidkernel-gcc --version || aarch64-linux-android-gcc --version) | head -n1
-          arm-linux-androideabi-gcc --version | head -n1
+          command -v aarch64-linux-gnu-ld aarch64-linux-gnu-ld.gold arm-linux-gnueabi-ld
+          # the kernel Makefile passes -polly-* options, so confirm clang accepts them
+          echo 'int main(void){return 0;}' > /tmp/t.c
+          clang -O3 -mllvm -polly -mllvm -polly-reschedule=1 -c /tmp/t.c -o /tmp/t.o \
+            && echo "polly options accepted"
 
       - name: Clone kernel
         run: |
@@ -233,8 +201,8 @@ jobs:
           mk() {
             make -s O=out ARCH=arm64 CC=clang HOSTCC=clang \
               CLANG_TRIPLE=aarch64-linux-gnu- \
-              CROSS_COMPILE=aarch64-linux-androidkernel- \
-              CROSS_COMPILE_ARM32=arm-linux-androideabi- "$@"
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- "$@"
           }
 
           mk "${{ steps.cfg.outputs.name }}"
@@ -313,8 +281,8 @@ jobs:
           # make -s keeps the log small; errors are still printed.
           make -s -j"$(nproc --all)" O=out ARCH=arm64 CC=clang HOSTCC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-androidkernel- \
-            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Show the first errors in the run summary (no need to open the log)
