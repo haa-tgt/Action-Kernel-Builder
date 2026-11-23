@@ -168,7 +168,8 @@ jobs:
           cd ~/kernel
           if [ "${{ steps.vars.outputs.ksu }}" != "true" ]; then
             echo "added=no (disabled)" >> "$GITHUB_OUTPUT"
-          elif [ -d drivers/kernelsu ] || grep -rqs "config KSU" drivers/Kconfig drivers/kernelsu 2>/dev/null; then
+          elif [ -d drivers/kernelsu ] || [ -d drivers/staging/kernelsu ] \
+               || grep -rqsE "^config KSU" --include='Kconfig*' drivers; then
             echo "KernelSU already present in the tree, skipping setup"
             echo "added=already in source" >> "$GITHUB_OUTPUT"
           else
