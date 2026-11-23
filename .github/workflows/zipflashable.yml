@@ -135,8 +135,23 @@ jobs:
         run: |
           cd ~/kernel
           DEF="${{ steps.vars.outputs.defconfig }}"
+          SCORES=""
           if [ -z "$DEF" ]; then
-            DEF="$(cd arch/arm64/configs && find . -type f \( -iname '*miatoll*' -o -iname '*curtana*' -o -iname '*atoll*' -o -iname '*sm6250*' \) | sed 's|^\./||' | sort | head -n1)"
+            # Auto-detect: score every candidate and take the best one.
+            #   +4 miatoll, +3 curtana, +1 atoll/sm6250, +1 "perf" (production build),
+            #   +2 if it enables SCHED_WALT, -10 for debug configs.
+            while IFS= read -r n; do
+              lc="$(echo "$n" | tr 'A-Z' 'a-z')"
+              sc=0
+              case "$lc" in *debug*) sc=$((sc-10));; esac
+              case "$lc" in *miatoll*) sc=$((sc+4));; esac
+              case "$lc" in *curtana*) sc=$((sc+3));; esac
+              case "$lc" in *atoll*|*sm6250*) sc=$((sc+1));; esac
+              case "$lc" in *perf*) sc=$((sc+1));; esac
+              if grep -q "^CONFIG_SCHED_WALT=y" "arch/arm64/configs/$n"; then sc=$((sc+2)); fi
+              SCORES="${SCORES}${sc} ${n}"$'\n'
+            done < <(cd arch/arm64/configs && find . -type f \( -iname '*miatoll*' -o -iname '*curtana*' -o -iname '*atoll*' -o -iname '*sm6250*' \) | sed 's|^\./||')
+            DEF="$(printf '%s' "$SCORES" | sort -t' ' -k1,1nr -k2 | head -n1 | cut -d' ' -f2-)"
           fi
           if [ -z "$DEF" ] || [ ! -f "arch/arm64/configs/$DEF" ]; then
             echo "::error::Defconfig not found. Available:"
@@ -146,6 +161,12 @@ jobs:
           echo "name=$DEF" >> "$GITHUB_OUTPUT"
           {
             echo "### Defconfig: $DEF"
+            if [ -n "$SCORES" ]; then
+              echo "Auto-detect scores (higher wins):"
+              echo '```'
+              printf '%s' "$SCORES" | sort -t' ' -k1,1nr -k2
+              echo '```'
+            fi
             echo "### Frequency table candidates (for an overclock patch)"
             echo '```'
             grep -rnE "qcom,gpu-freq|opp-hz|qcom,cpu-lut|qcom,cpufreq-hw" \
@@ -282,6 +303,31 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Diagnose undefined scheduler symbols (summary only)
+        if: failure()
+        run: |
+          cd ~/kernel
+          {
+            echo "### Diagnosis"
+            echo "Defconfig used: ${{ steps.cfg.outputs.name }}"
+            echo '```'
+            echo "== Candidate defconfigs =="
+            (cd arch/arm64/configs && find . -type f \( -iname '*miatoll*' -o -iname '*curtana*' -o -iname '*atoll*' -o -iname '*sm6250*' \) | sort) || true
+            echo
+            echo "== Defconfigs that enable SCHED_WALT =="
+            grep -rl "CONFIG_SCHED_WALT=y" arch/arm64/configs | head -n 20 || true
+            echo
+            echo "== Scheduler options in the final .config =="
+            grep -nE "CONFIG_SCHED_WALT|CONFIG_SCHED_HMP|CONFIG_SMP=|CONFIG_SCHED_TUNE|CONFIG_CPU_FREQ_GOV_SCHEDUTIL" out/.config || true
+            echo
+            echo "== Where the two symbols are defined/used =="
+            grep -rn "sysctl_sched_conservative_pl\|sysctl_sched_many_wakeup_threshold" kernel include --include='*.c' --include='*.h' | head -n 30 || true
+            echo
+            echo "== Guard around them in kernel/sysctl.c =="
+            grep -n -B8 "sysctl_sched_conservative_pl" kernel/sysctl.c | head -n 40 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate changelog
         env:
