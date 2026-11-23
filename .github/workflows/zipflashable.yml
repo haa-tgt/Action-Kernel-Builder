@@ -119,6 +119,35 @@ jobs:
           echo "$HOME/toolchains/arm64/bin" >> "$GITHUB_PATH"
           echo "$HOME/toolchains/arm32/bin" >> "$GITHUB_PATH"
 
+      - name: Fill in missing binutils tools (ld.gold etc.)
+        run: |
+          # Some kernels link with ld.gold. The AOSP GCC prebuilts under the
+          # "androidkernel" prefix don't ship it, so borrow the matching tool
+          # from Ubuntu's cross binutils and expose it under the expected name.
+          sudo apt-get install -y -qq --no-install-recommends \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+          SHIM="$HOME/shims"
+          mkdir -p "$SHIM"
+          shim() {
+            want="$1"; shift
+            if command -v "$want" >/dev/null 2>&1; then return 0; fi
+            for alt in "$@"; do
+              if p="$(command -v "$alt" 2>/dev/null)"; then
+                ln -sf "$p" "$SHIM/$want"
+                echo "shim: $want -> $p"
+                return 0
+              fi
+            done
+            echo "::warning::no replacement found for $want"
+          }
+          for t in ld ld.bfd ld.gold; do
+            shim "aarch64-linux-androidkernel-$t" "aarch64-linux-android-$t" "aarch64-linux-gnu-$t"
+            shim "aarch64-linux-android-$t"       "aarch64-linux-androidkernel-$t" "aarch64-linux-gnu-$t"
+            shim "arm-linux-androideabi-$t"       "arm-linux-gnueabi-$t" "arm-linux-gnueabihf-$t"
+          done
+          echo "$SHIM" >> "$GITHUB_PATH"
+          ls -l "$SHIM" || true
+
       - name: Verify toolchains
         run: |
           clang --version | head -n1
