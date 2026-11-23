@@ -253,10 +253,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build kernel
+        shell: bash
         run: |
+          # GitHub's default shell does NOT enable pipefail, so without this a
+          # failed make would be hidden by "| tee" and the step would look green.
+          set -eo pipefail
           cd ~/kernel
           # make -s keeps the log small; errors are still printed.
-          # bash + pipefail (the Actions default): a failed make fails this step.
           make -s -j"$(nproc --all)" O=out ARCH=arm64 CC=clang HOSTCC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-androidkernel- \
@@ -264,7 +267,7 @@ jobs:
             2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Show the first errors in the run summary (no need to open the log)
-        if: failure()
+        if: always()
         run: |
           if [ -f build.log ]; then
             {
@@ -313,6 +316,11 @@ jobs:
         run: |
           BOOT="$HOME/kernel/out/arch/arm64/boot"
           mkdir -p "$GITHUB_WORKSPACE/out_files"
+          if ! ls "$BOOT"/Image* >/dev/null 2>&1; then
+            echo "::error::The kernel was not built (no Image in $BOOT). See 'First errors' in the run summary."
+            ls -la "$BOOT" 2>&1 || true
+            exit 1
+          fi
           cd ~
           git clone -q --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           cd ak3
@@ -385,15 +393,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ls -lh out_files/
-          TAG="build-${{ github.run_number }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" out_files/* --clobber
-          else
-            gh release create "$TAG" out_files/* \
-              --title "Kinesis v24 build #${{ github.run_number }}" \
-              --notes-file out_files/CHANGELOG.md
-          fi
+          gh release create "build-${{ github.run_number }}" out_files/* \
+            --title "Kinesis v24 build #${{ github.run_number }}" \
+            --notes-file out_files/CHANGELOG.md
 
       - name: Upload build log
         if: always()
