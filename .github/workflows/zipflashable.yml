@@ -45,6 +45,9 @@ env:
   # Proton clang: newer than AOSP clang r416183b and includes Polly, which this
   # kernel's Makefile needs (-polly-* options). It also ships aarch64/arm binutils.
   TOOLCHAIN_REPO: https://github.com/kdrag0n/proton-clang
+  # Use LLVM's linker/binutils. ThinLTO passes lld-only options (e.g. --thinlto-cache-dir),
+  # which GNU gold rejects.
+  LLVM_TOOLS: LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
   # Defaults used when the run is triggered by a push (no inputs available)
   DEFAULT_BRANCH: kinesis-v24-bpf
   DEFAULT_KSU_REF: v0.9.5
@@ -117,7 +120,8 @@ jobs:
         run: |
           clang --version | head -n1
           command -v aarch64-linux-gnu-ld aarch64-linux-gnu-ld.gold arm-linux-gnueabi-ld
-          ld.lld --version | head -n1 || true
+          command -v ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip
+          ld.lld --version | head -n1
 
       - name: Clone kernel
         run: |
@@ -223,7 +227,7 @@ jobs:
             make -s O=out ARCH=arm64 CC=clang HOSTCC=clang \
               CLANG_TRIPLE=aarch64-linux-gnu- \
               CROSS_COMPILE=aarch64-linux-gnu- \
-              CROSS_COMPILE_ARM32=arm-linux-gnueabi- "$@"
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- $LLVM_TOOLS "$@"
           }
 
           mk "${{ steps.cfg.outputs.name }}"
@@ -303,7 +307,7 @@ jobs:
           make -s -j"$(nproc --all)" O=out ARCH=arm64 CC=clang HOSTCC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- $LLVM_TOOLS \
             2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
       - name: Show the first errors in the run summary (no need to open the log)
