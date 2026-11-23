@@ -119,10 +119,29 @@ jobs:
           echo "$HOME/toolchains/arm64/bin" >> "$GITHUB_PATH"
           echo "$HOME/toolchains/arm32/bin" >> "$GITHUB_PATH"
 
+      # --- FIX 1: Detect the actual GCC prefix instead of hardcoding ---
+      - name: Detect GCC cross-compiler prefixes
+        id: gcc
+        run: |
+          # The arm64 GCC prebuilt may ship as aarch64-linux-androidkernel-
+          # or as aarch64-linux-android-. Detect whichever is present.
+          if command -v aarch64-linux-androidkernel-gcc &>/dev/null; then
+            echo "cross=aarch64-linux-androidkernel-" >> "$GITHUB_OUTPUT"
+          elif command -v aarch64-linux-android-gcc &>/dev/null; then
+            echo "cross=aarch64-linux-android-" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No aarch64 GCC cross-compiler found in PATH"
+            ls -1 "$HOME/toolchains/arm64/bin/" | head -20
+            exit 1
+          fi
+
       - name: Verify toolchains
         run: |
+          echo "Clang:"
           clang --version | head -n1
-          (aarch64-linux-androidkernel-gcc --version || aarch64-linux-android-gcc --version) | head -n1
+          echo "GCC arm64 (prefix: ${{ steps.gcc.outputs.cross }}):"
+          ${{ steps.gcc.outputs.cross }}gcc --version | head -n1
+          echo "GCC arm32:"
           arm-linux-androideabi-gcc --version | head -n1
 
       - name: Clone kernel
@@ -176,22 +195,22 @@ jobs:
             echo "added=yes (${{ steps.vars.outputs.ksu_ref }})" >> "$GITHUB_OUTPUT"
           fi
 
+      # --- FIX 2: Use detected GCC prefix in every make invocation ---
       - name: Configure kernel
+        env:
+          CROSS: ${{ steps.gcc.outputs.cross }}
         run: |
           cd ~/kernel
           mk() {
             make -s O=out ARCH=arm64 CC=clang HOSTCC=clang \
               CLANG_TRIPLE=aarch64-linux-gnu- \
-              CROSS_COMPILE=aarch64-linux-androidkernel- \
+              CROSS_COMPILE="$CROSS" \
               CROSS_COMPILE_ARM32=arm-linux-androideabi- "$@"
           }
 
           mk "${{ steps.cfg.outputs.name }}"
 
           # ---- CPU mask fix -------------------------------------------------
-          # This tree has custom LITTLE_CPU_MASK / BIG_CPU_MASK options that the
-          # defconfig leaves empty, so the build stops at an interactive prompt.
-          # Find the option's TYPE in Kconfig and write a value of that type.
           KFILE="$(grep -rl --include='Kconfig*' '^config LITTLE_CPU_MASK' . 2>/dev/null | head -n1 || true)"
           TYPE=""
           if [ -n "$KFILE" ]; then
@@ -240,9 +259,7 @@ jobs:
 
           mk olddefconfig
 
-          # Answer any remaining new-symbol prompts with their defaults so the
-          # build can never block waiting for input. pipefail is switched off
-          # inside the subshell because "yes" exits with SIGPIPE.
+          # Answer any remaining new-symbol prompts with their defaults
           ( set +o pipefail; yes "" | mk oldconfig > /dev/null 2>&1 ) || true
 
           {
@@ -252,16 +269,44 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # --- FIX 3: Removed -s, added explicit pipefail, use detected prefix ---
       - name: Build kernel
+        env:
+          CROSS: ${{ steps.gcc.outputs.cross }}
         run: |
+          set -eo pipefail
           cd ~/kernel
-          # make -s keeps the log small; errors are still printed.
-          # bash + pipefail (the Actions default): a failed make fails this step.
-          make -s -j"$(nproc --all)" O=out ARCH=arm64 CC=clang HOSTCC=clang \
+          make -j"$(nproc --all)" O=out ARCH=arm64 CC=clang HOSTCC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-androidkernel- \
+            CROSS_COMPILE="$CROSS" \
             CROSS_COMPILE_ARM32=arm-linux-androideabi- \
             2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      # --- FIX 4: Verify boot image exists before packaging ---
+      - name: Verify kernel image
+        run: |
+          BOOT="$HOME/kernel/out/arch/arm64/boot"
+          echo "--- Contents of $BOOT ---"
+          ls -lhR "$BOOT" 2>/dev/null || true
+          echo "---"
+          # Check for any known image format
+          if   [ -f "$BOOT/Image.gz-dtb" ]; then echo "Found: Image.gz-dtb"
+          elif [ -f "$BOOT/Image.gz" ];     then echo "Found: Image.gz"
+          elif [ -f "$BOOT/Image" ];        then echo "Found: Image"
+          elif [ -f "$BOOT/Image.lz4" ];    then echo "Found: Image.lz4"
+          elif [ -f "$BOOT/zImage" ];       then echo "Found: zImage"
+          else
+            echo "::error::No kernel image produced in $BOOT"
+            echo "### Build produced no kernel image" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            ls -lhR "$BOOT" >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "### Last 50 lines of build.log" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 50 "$GITHUB_WORKSPACE/build.log" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
       - name: Show the first errors in the run summary (no need to open the log)
         if: failure()
@@ -309,12 +354,76 @@ jobs:
           } > "$GITHUB_WORKSPACE/out_files/CHANGELOG.md"
           cat "$GITHUB_WORKSPACE/out_files/CHANGELOG.md" >> "$GITHUB_STEP_SUMMARY"
 
+      # --- FIX 5: Broader image detection + Image.lz4/zImage support ---
+      - name: Package flashable zip (AnyKernel3)
+        run: |
+          BOOT="$HOME/kernel/out/arch/arm64/boot"
+          mkdir -p "$GITHUB_WORKSPACE/out_files"
+          cd ~
+          git clone -q --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git .github README.md
+
+          cat > anykernel.sh <<'EOF'
+          # AnyKernel3 script for Miatoll (SM6250)
+          properties() { '
+          kernel.string=Kinesis v24 BPF build
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=miatoll
+          device.name2=curtana
+          device.name3=excalibur
+          device.name4=gram
+          device.name5=joyeuse
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          # boot image location (Miatoll is A-only)
+          BLOCK=boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+
+          # Use whichever kernel image the build produced
+          if   [ -f "$BOOT/Image.gz-dtb" ]; then cp "$BOOT/Image.gz-dtb" .
+          elif [ -f "$BOOT/Image.gz" ];     then cp "$BOOT/Image.gz" .
+          elif [ -f "$BOOT/Image" ];        then cp "$BOOT/Image" .
+          elif [ -f "$BOOT/Image.lz4" ];    then cp "$BOOT/Image.lz4" .
+          elif [ -f "$BOOT/zImage" ];       then cp "$BOOT/zImage" .
+          else
+            echo "::error::No kernel image found in $BOOT"
+            echo "Contents of $BOOT:"
+            ls -lhR "$BOOT" 2>/dev/null || echo "(directory does not exist)"
+            exit 1
+          fi
+
+          # Separate dtbs (only needed when the dtb isn't appended to the image)
+          if [ ! -f Image.gz-dtb ]; then
+            find "$HOME/kernel/out/arch/arm64/boot/dts" -name '*.dtb' | sort | xargs -r cat > dtb || true
+            [ -s dtb ] || rm -f dtb
+          fi
+
+          ZIP="Kinesis-v24-miatoll-${{ github.run_number }}.zip"
+          zip -r9 "$GITHUB_WORKSPACE/out_files/$ZIP" . -x '*.git*'
+          ls -lh "$GITHUB_WORKSPACE/out_files/$ZIP"
+
       - name: Collect artifacts
         run: |
           mkdir -p "$GITHUB_WORKSPACE/out_files"
           cd ~/kernel
           cp out/.config "$GITHUB_WORKSPACE/out_files/config"
-          find out/arch/arm64/boot -maxdepth 1 -type f \( -name 'Image*' -o -name 'dtbo.img' \) \
+          find out/arch/arm64/boot -maxdepth 1 -type f \( -name 'Image*' -o -name 'dtbo.img' -o -name 'zImage' \) \
             -exec cp {} "$GITHUB_WORKSPACE/out_files/" \;
           find out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} "$GITHUB_WORKSPACE/out_files/" \; || true
           ls -lh "$GITHUB_WORKSPACE/out_files"
@@ -329,9 +438,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "build-${{ github.run_number }}" out_files/* \
-            --title "Kinesis v24 build #${{ github.run_number }}" \
-            --notes-file out_files/CHANGELOG.md
+          ls -lh out_files/
+          TAG="build-${{ github.run_number }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out_files/* --clobber
+          else
+            gh release create "$TAG" out_files/* \
+              --title "Kinesis v24 build #${{ github.run_number }}" \
+              --notes-file out_files/CHANGELOG.md
+          fi
 
       - name: Upload build log
         if: always()
